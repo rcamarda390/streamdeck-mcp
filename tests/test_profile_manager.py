@@ -15,6 +15,9 @@ from profile_manager import (
     ProfileManagerError,
     ProfileValidationError,
     StreamDeckAppRunningError,
+    WindowsProcess,
+    is_stream_deck_app_running,
+    stop_stream_deck_app,
 )
 
 
@@ -22,13 +25,16 @@ from profile_manager import (
 def _stub_stream_deck_app_not_running():
     """Default: act as if the Stream Deck app is not running so tests hit the write path."""
 
-    with patch("profile_manager.is_stream_deck_app_running", return_value=False):
+    with (
+        patch("profile_manager.is_stream_deck_app_running", return_value=False),
+        patch("profile_manager._profile_writes_supported", return_value=True),
+    ):
         yield
 
 
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload))
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _make_page_manifest(actions: dict | None = None, *, name: str = "") -> dict:
@@ -1635,6 +1641,202 @@ def test_restart_app_errors_when_app_missing(sample_profiles_v3: Path, tmp_path:
             manager.restart_app()
 
 
+def test_windows_app_not_running_uses_exact_process_lookup() -> None:
+    with (
+        patch("profile_manager.sys.platform", "win32"),
+        patch("profile_manager._windows_stream_deck_processes", return_value=[]),
+    ):
+        assert not is_stream_deck_app_running()
+
+
+def test_windows_write_refuses_running_app_without_auto_quit(
+    sample_profiles_v3: Path, tmp_path: Path
+) -> None:
+    manager = ProfileManager(
+        profiles_dir=sample_profiles_v3,
+        scripts_dir=tmp_path / "scripts",
+        generated_icons_dir=tmp_path / "icons",
+    )
+
+    with (
+        patch("profile_manager.sys.platform", "win32"),
+        patch("profile_manager.is_stream_deck_app_running", return_value=True),
+    ):
+        with pytest.raises(StreamDeckAppRunningError, match="running"):
+            manager.write_page(
+                profile_name="Default Profile",
+                directory_id="BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+                buttons=[{"key": 0, "title": "blocked", "action_type": "next_page"}],
+            )
+
+    page = manager.read_page(
+        profile_name="Default Profile",
+        directory_id="BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+    )
+    assert page["buttons"][0]["title"] != "blocked"
+
+
+def test_windows_graceful_close_waits_for_exit() -> None:
+    process = WindowsProcess(pid=41)
+    with (
+        patch("profile_manager.sys.platform", "win32"),
+        patch(
+            "profile_manager._windows_stream_deck_processes",
+            side_effect=[[process], []],
+        ),
+        patch("profile_manager._request_windows_app_close", return_value={41}) as request_close,
+    ):
+        report = stop_stream_deck_app(graceful_timeout=0)
+
+    request_close.assert_called_once_with({41})
+    assert report == {
+        "stopped": True,
+        "graceful": ["StreamDeck.exe"],
+        "forced": [],
+        "reason": "",
+    }
+
+
+def test_windows_graceful_close_timeout_never_forces_termination() -> None:
+    process = WindowsProcess(pid=41)
+    with (
+        patch("profile_manager.sys.platform", "win32"),
+        patch("profile_manager._windows_stream_deck_processes", return_value=[process]),
+        patch("profile_manager._request_windows_app_close", return_value={41}),
+    ):
+        report = stop_stream_deck_app(graceful_timeout=0)
+
+    assert report["stopped"] is False
+    assert report["forced"] == []
+    assert report["reason"] == "graceful close timed out"
+
+
+def test_windows_write_auto_quit_waits_until_process_exits(
+    sample_profiles_v3: Path, tmp_path: Path
+) -> None:
+    manager = ProfileManager(
+        profiles_dir=sample_profiles_v3,
+        scripts_dir=tmp_path / "scripts",
+        generated_icons_dir=tmp_path / "icons",
+    )
+    stop_report = {"stopped": True, "graceful": ["StreamDeck.exe"], "forced": []}
+
+    with (
+        patch("profile_manager.sys.platform", "win32"),
+        patch("profile_manager.is_stream_deck_app_running", side_effect=[True, False]),
+        patch("profile_manager.stop_stream_deck_app", return_value=stop_report) as stop_mock,
+    ):
+        result = manager.write_page(
+            profile_name="Default Profile",
+            directory_id="BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+            buttons=[{"key": 0, "title": "written", "action_type": "next_page"}],
+            auto_quit_app=True,
+        )
+
+    stop_mock.assert_called_once_with(graceful_timeout=5.0)
+    assert result["app_quit"] == stop_report
+
+
+def test_windows_restart_launches_path_with_spaces_and_non_ascii(
+    sample_profiles_v3: Path, tmp_path: Path
+) -> None:
+    manager = ProfileManager(
+        profiles_dir=sample_profiles_v3,
+        scripts_dir=tmp_path / "scripts",
+        generated_icons_dir=tmp_path / "icons",
+    )
+    app_path = tmp_path / "Elgato Déck" / "StreamDeck.exe"
+    app_path.parent.mkdir()
+    app_path.touch()
+
+    with (
+        patch("profile_manager.sys.platform", "win32"),
+        patch.dict("os.environ", {"STREAMDECK_APP_PATH": str(app_path)}),
+        patch("profile_manager.stop_stream_deck_app", return_value={"stopped": False}),
+        patch("profile_manager.is_stream_deck_app_running", return_value=False),
+        patch("profile_manager._wait_for_windows_app_state", return_value=True),
+        patch("profile_manager.subprocess.Popen") as popen,
+    ):
+        result = manager.restart_app()
+
+    popen.assert_called_once()
+    assert popen.call_args.args[0] == [str(app_path)]
+    assert popen.call_args.kwargs["shell"] is False
+    assert result["restarted"] is True
+    assert result["app_path"] == str(app_path)
+
+
+def test_windows_restart_reports_start_failure_without_rollback(
+    sample_profiles_v3: Path, tmp_path: Path
+) -> None:
+    manager = ProfileManager(
+        profiles_dir=sample_profiles_v3,
+        scripts_dir=tmp_path / "scripts",
+        generated_icons_dir=tmp_path / "icons",
+    )
+    app_path = tmp_path / "StreamDeck.exe"
+    app_path.touch()
+
+    with (
+        patch("profile_manager.sys.platform", "win32"),
+        patch.dict("os.environ", {"STREAMDECK_APP_PATH": str(app_path)}),
+        patch("profile_manager.stop_stream_deck_app", return_value={"stopped": False}),
+        patch("profile_manager.is_stream_deck_app_running", return_value=False),
+        patch("profile_manager._wait_for_windows_app_state", return_value=False),
+        patch("profile_manager.subprocess.Popen"),
+    ):
+        with pytest.raises(ProfileManagerError, match="Profile edits were kept"):
+            manager.restart_app()
+
+
+def test_windows_process_detection_error_fails_closed() -> None:
+    with (
+        patch("profile_manager.sys.platform", "win32"),
+        patch(
+            "profile_manager._windows_stream_deck_processes",
+            side_effect=ProfileManagerError("Windows process detection failed"),
+        ),
+    ):
+        with pytest.raises(ProfileManagerError, match="detection failed"):
+            is_stream_deck_app_running()
+
+
+def test_windows_restart_errors_when_installation_path_cannot_be_found(
+    sample_profiles_v3: Path, tmp_path: Path
+) -> None:
+    manager = ProfileManager(
+        profiles_dir=sample_profiles_v3,
+        scripts_dir=tmp_path / "scripts",
+        generated_icons_dir=tmp_path / "icons",
+    )
+
+    with (
+        patch("profile_manager.sys.platform", "win32"),
+        patch.dict("os.environ", {}, clear=True),
+        patch("profile_manager._windows_stream_deck_processes", return_value=[]),
+    ):
+        with pytest.raises(ProfileManagerError, match="could not be found"):
+            manager.restart_app()
+
+
+def test_write_page_rejects_unsupported_profile_writer_platform(
+    sample_profiles_v3: Path, tmp_path: Path
+) -> None:
+    manager = ProfileManager(
+        profiles_dir=sample_profiles_v3,
+        scripts_dir=tmp_path / "scripts",
+        generated_icons_dir=tmp_path / "icons",
+    )
+
+    with patch("profile_manager._profile_writes_supported", return_value=False):
+        with pytest.raises(ProfileManagerError, match="Windows uvx.exe"):
+            manager.write_page(
+                profile_name="Default Profile",
+                directory_id="BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+                buttons=[],
+            )
+
+
 def _icon_manager(tmp_path: Path) -> ProfileManager:
     return ProfileManager(
         profiles_dir=tmp_path / "profiles",
@@ -2138,6 +2340,59 @@ def test_list_profiles_marks_unknown_models_clearly(tmp_path: Path) -> None:
     )
     profiles = manager.list_profiles()
     assert profiles[0]["device"]["ModelName"] == "Unknown Stream Deck model (20GZ9999)"
+
+
+def test_list_profiles_reads_utf8_page_manifests(tmp_path: Path) -> None:
+    profiles_dir = tmp_path / "ProfilesV3"
+    profile_dir = profiles_dir / "UTF8.sdProfile"
+    page_uuid = "83480d17-dfd9-4fd1-afbc-7e318f88d2b5"
+    _write_json(
+        profile_dir / "manifest.json",
+        {
+            "AppIdentifier": "*",
+            "Device": {"Model": "20GBA9901", "UUID": "@(1)"},
+            "Name": "UTF-8 Profile",
+            "Pages": {"Current": page_uuid, "Default": None, "Pages": []},
+            "Version": "3.0",
+        },
+    )
+    page_manifest_path = profile_dir / "Profiles" / page_uuid.upper() / "manifest.json"
+    page_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    page_manifest_path.write_text(
+        json.dumps(
+            _make_page_manifest(
+                {
+                    "0,0": {
+                        "ActionID": "action-open",
+                        "Name": "Thumbs up",
+                        "Settings": {"pastedText": "👍"},
+                        "State": 0,
+                        "States": [{}],
+                        "UUID": "com.elgato.streamdeck.system.text",
+                    }
+                },
+                name="Emoji",
+            ),
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    manager = ProfileManager(
+        profiles_dir=profiles_dir,
+        scripts_dir=tmp_path / "scripts",
+        generated_icons_dir=tmp_path / "icons",
+    )
+
+    profiles = manager.list_profiles()
+
+    assert len(profiles) == 1
+    assert profiles[0]["pages"][0]["name"] == "Emoji"
+    page = manager.read_page(profile_name="UTF-8 Profile", page_index=0)
+    pasted_text = page["raw_manifest"]["Controllers"][0]["Actions"]["0,0"]["Settings"][
+        "pastedText"
+    ]
+    assert pasted_text == "👍"
 
 
 def test_create_icons_generates_batch_in_one_call(tmp_path: Path) -> None:
