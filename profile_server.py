@@ -521,10 +521,11 @@ async def list_tools() -> list[Tool]:
                         **_scalar_or_string("boolean"),
                         "description": (
                             "If true and the Elgato Stream Deck desktop app is "
-                            "running, quit it (graceful AppleScript first, then "
-                            "killall) before writing. Required when the app is "
-                            "running or the write will raise an error. Defaults "
-                            "to false so callers must explicitly consent to quitting it."
+                            "running, request a graceful quit before writing. On "
+                            "Windows, a close timeout aborts the write; it never "
+                            "forces termination. Required when the app is running "
+                            "or the write will raise an error. Defaults to false "
+                            "so callers must explicitly consent to quitting it."
                         ),
                     },
                 },
@@ -682,7 +683,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="streamdeck_restart_app",
-            description="Restart the macOS Stream Deck desktop app after profile changes.",
+            description=(
+                "Restart the macOS or Windows Stream Deck desktop app after profile changes. "
+                "On Windows, the app is launched only after a verified graceful stop."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {},

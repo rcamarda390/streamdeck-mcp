@@ -110,6 +110,9 @@ MODEL_NAMES: dict[str, str] = {
 STREAM_DECK_APP_PROCESS_NAMES = ("Stream Deck", "Elgato Stream Deck")
 DEFAULT_STREAM_DECK_APP_PATH = Path("/Applications/Elgato Stream Deck.app")
 STREAM_DECK_APP_PATH_ENV = "STREAMDECK_APP_PATH"
+WINDOWS_STREAM_DECK_PROCESS_NAME = "StreamDeck.exe"
+WINDOWS_APP_CLOSE_TIMEOUT = 5.0
+WINDOWS_PROCESS_POLL_INTERVAL = 0.2
 
 HEX_COLOR_PATTERN = re.compile(r"^#[0-9a-fA-F]{6}$")
 POSITION_PATTERN = re.compile(r"^\d+,\d+$")
@@ -253,6 +256,14 @@ class PageRef:
         }
 
 
+@dataclass(frozen=True)
+class WindowsProcess:
+    """A Stream Deck process discovered through the Windows process snapshot API."""
+
+    pid: int
+    image_path: Path | None = None
+
+
 def _normalize_uuid(value: str) -> str:
     return value.strip().lower()
 
@@ -263,7 +274,7 @@ def _looks_like_uuid(value: str) -> bool:
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ProfileManagerError(f"Missing file: {path}") from exc
     except json.JSONDecodeError as exc:
@@ -273,7 +284,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(f"{path.suffix}.tmp")
-    temp_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+    temp_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     temp_path.replace(path)
 
 
@@ -399,6 +410,195 @@ def _resolve_app_path() -> Path:
     return DEFAULT_STREAM_DECK_APP_PATH
 
 
+def _profile_writes_supported() -> bool:
+    """Return whether this process can safely manage desktop profile files."""
+
+    return sys.platform in {"darwin", "win32"}
+
+
+def _windows_stream_deck_processes() -> list[WindowsProcess]:
+    """Return exact StreamDeck.exe processes without parsing command output.
+
+    Process image-path access is intentionally best effort: an inaccessible
+    matching process is still reported so callers fail closed rather than
+    accidentally writing profiles while the desktop app is running.
+    """
+
+    if sys.platform != "win32":
+        return []
+
+    import ctypes
+    from ctypes import wintypes
+
+    th32cs_snprocess = 0x00000002
+    process_query_limited_information = 0x1000
+    error_no_more_files = 18
+    invalid_handle_value = ctypes.c_void_p(-1).value
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(th32cs_snprocess, 0)
+    if snapshot == invalid_handle_value:
+        raise ProfileManagerError(
+            "Windows process detection failed "
+            f"(CreateToolhelp32Snapshot error {ctypes.get_last_error()})."
+        )
+
+    def image_path_for(pid: int) -> Path | None:
+        process = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not process:
+            return None
+        try:
+            buffer = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buffer))
+            if kernel32.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)):
+                return Path(buffer.value)
+            return None
+        finally:
+            kernel32.CloseHandle(process)
+
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(ProcessEntry32W)
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            error = ctypes.get_last_error()
+            if error == error_no_more_files:
+                return []
+            raise ProfileManagerError(
+                f"Windows process detection failed (Process32FirstW error {error})."
+            )
+
+        processes: list[WindowsProcess] = []
+        while True:
+            if entry.szExeFile.casefold() == WINDOWS_STREAM_DECK_PROCESS_NAME.casefold():
+                processes.append(
+                    WindowsProcess(
+                        pid=int(entry.th32ProcessID), image_path=image_path_for(entry.th32ProcessID)
+                    )
+                )
+
+            entry.dwSize = ctypes.sizeof(ProcessEntry32W)
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                error = ctypes.get_last_error()
+                if error == error_no_more_files:
+                    break
+                raise ProfileManagerError(
+                    f"Windows process detection failed (Process32NextW error {error})."
+                )
+        return processes
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+
+def _request_windows_app_close(process_ids: set[int]) -> set[int]:
+    """Post WM_CLOSE to top-level windows owned by the target process IDs."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    wm_close = 0x0010
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_windows_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [enum_windows_proc, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+
+    requested: set[int] = set()
+
+    def close_window(hwnd: int, _lparam: int) -> bool:
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in process_ids and user32.PostMessageW(hwnd, wm_close, 0, 0):
+            requested.add(int(pid.value))
+        return True
+
+    callback = enum_windows_proc(close_window)
+    if not user32.EnumWindows(callback, 0):
+        raise ProfileManagerError(
+            f"Windows app shutdown request failed (EnumWindows error {ctypes.get_last_error()})."
+        )
+    return requested
+
+
+def _wait_for_windows_app_state(*, running: bool, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if bool(_windows_stream_deck_processes()) is running:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(WINDOWS_PROCESS_POLL_INTERVAL)
+
+
+def _resolve_windows_app_path() -> Path:
+    override = os.environ.get(STREAM_DECK_APP_PATH_ENV)
+    if override:
+        candidate = Path(override).expanduser()
+        if (
+            candidate.is_file()
+            and candidate.name.casefold() == WINDOWS_STREAM_DECK_PROCESS_NAME.casefold()
+        ):
+            return candidate
+        raise ProfileManagerError(
+            f"Stream Deck executable not found at {candidate}. Set {STREAM_DECK_APP_PATH_ENV} "
+            "to the full path of StreamDeck.exe."
+        )
+
+    for process in _windows_stream_deck_processes():
+        if process.image_path and process.image_path.is_file():
+            return process.image_path
+
+    candidates: list[Path] = []
+    for variable in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(
+                Path(root) / "Elgato" / "StreamDeck" / WINDOWS_STREAM_DECK_PROCESS_NAME
+            )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    raise ProfileManagerError(
+        "Stream Deck executable could not be found. Set "
+        f"{STREAM_DECK_APP_PATH_ENV} to the full path of StreamDeck.exe and retry."
+    )
+
+
 def get_plugins_dir() -> Path:
     """Return the Elgato Stream Deck plugins directory for the current OS."""
     home = Path.home()
@@ -463,18 +663,19 @@ def ensure_mcp_plugin_installed(*, force: bool = False) -> dict[str, Any]:
 def is_stream_deck_app_running() -> bool:
     """Return True if the Elgato Stream Deck desktop app is currently running."""
 
-    if sys.platform != "darwin":
+    if sys.platform == "darwin":
+        for name in STREAM_DECK_APP_PROCESS_NAMES:
+            result = subprocess.run(
+                ["pgrep", "-x", name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return True
         return False
-
-    for name in STREAM_DECK_APP_PROCESS_NAMES:
-        result = subprocess.run(
-            ["pgrep", "-x", name],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return True
+    if sys.platform == "win32":
+        return bool(_windows_stream_deck_processes())
     return False
 
 
@@ -486,8 +687,33 @@ def stop_stream_deck_app(*, graceful_timeout: float = 3.0) -> dict[str, Any]:
     which path was taken.
     """
 
+    if sys.platform == "win32":
+        processes = _windows_stream_deck_processes()
+        if not processes:
+            return {"stopped": False, "graceful": [], "forced": [], "reason": "not running"}
+
+        requested = _request_windows_app_close({process.pid for process in processes})
+        if not requested:
+            return {
+                "stopped": False,
+                "graceful": [],
+                "forced": [],
+                "reason": "no Stream Deck top-level window accepted a graceful close request",
+            }
+
+        stopped = _wait_for_windows_app_state(
+            running=False,
+            timeout=graceful_timeout,
+        )
+        return {
+            "stopped": stopped,
+            "graceful": [WINDOWS_STREAM_DECK_PROCESS_NAME],
+            "forced": [],
+            "reason": "graceful close timed out" if not stopped else "",
+        }
+
     if sys.platform != "darwin":
-        return {"stopped": False, "graceful": [], "forced": [], "reason": "non-darwin platform"}
+        return {"stopped": False, "graceful": [], "forced": [], "reason": "unsupported platform"}
 
     if not is_stream_deck_app_running():
         return {"stopped": False, "graceful": [], "forced": [], "reason": "not running"}
@@ -1203,6 +1429,12 @@ class ProfileManager:
     ) -> dict[str, Any]:
         """Create a page or rewrite an existing page manifest."""
 
+        if not _profile_writes_supported():
+            raise ProfileManagerError(
+                "Desktop profile writes are supported only when streamdeck-mcp runs on "
+                "macOS or Windows. For a WSL client, launch the server with Windows uvx.exe."
+            )
+
         app_stop_report: dict[str, Any] | None = None
         if is_stream_deck_app_running():
             if not auto_quit_app:
@@ -1212,7 +1444,10 @@ class ProfileManager:
                     "then call streamdeck_restart_app once your edits are complete "
                     "to apply the changes."
                 )
-            app_stop_report = stop_stream_deck_app()
+            if sys.platform == "win32":
+                app_stop_report = stop_stream_deck_app(graceful_timeout=WINDOWS_APP_CLOSE_TIMEOUT)
+            else:
+                app_stop_report = stop_stream_deck_app()
             stop_failed = not app_stop_report.get("stopped", False)
             still_running = is_stream_deck_app_running()
             if stop_failed or still_running:
@@ -1595,11 +1830,52 @@ class ProfileManager:
         }
 
     def restart_app(self) -> dict[str, Any]:
-        """Restart the Stream Deck desktop app on macOS."""
+        """Restart the Stream Deck desktop app on a supported desktop platform."""
+
+        if sys.platform == "win32":
+            app_path = _resolve_windows_app_path()
+            stop_report = stop_stream_deck_app(graceful_timeout=WINDOWS_APP_CLOSE_TIMEOUT)
+            if is_stream_deck_app_running():
+                reason = stop_report.get("reason", "")
+                detail = f" Reason: {reason}." if reason else ""
+                raise ProfileManagerError(
+                    "The Elgato Stream Deck app could not be stopped before restart."
+                    f"{detail} Close it manually and retry."
+                )
+
+            try:
+                subprocess.Popen(
+                    [str(app_path)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                    close_fds=True,
+                )
+            except OSError as exc:
+                raise ProfileManagerError(
+                    "Profile edits were kept, but Stream Deck could not be restarted. "
+                    f"Launch it manually from {app_path}: {exc}"
+                ) from exc
+
+            if not _wait_for_windows_app_state(
+                running=True,
+                timeout=WINDOWS_APP_CLOSE_TIMEOUT,
+            ):
+                raise ProfileManagerError(
+                    "Profile edits were kept, but Stream Deck did not start in time. "
+                    f"Launch it manually from {app_path}."
+                )
+
+            return {
+                "restarted": True,
+                "app_path": str(app_path),
+                "stop": stop_report,
+            }
 
         if sys.platform != "darwin":
             raise ProfileManagerError(
-                "streamdeck_restart_app is currently only supported on macOS."
+                "streamdeck_restart_app is currently only supported on macOS and Windows."
             )
 
         app_path = _resolve_app_path()

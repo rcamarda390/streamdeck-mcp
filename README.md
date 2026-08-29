@@ -147,6 +147,39 @@ args = ["streamdeck-mcp"]
 
 Anything that speaks MCP over stdio works the same way: point it at `uvx streamdeck-mcp`.
 
+### Windows 11 and WSL Clients
+
+The profile writer supports the Elgato desktop app on Windows 11. The tested installation
+route is the standard Elgato MSI or the `Elgato.StreamDeck` winget package. Microsoft Store
+installs are best-effort: set `STREAMDECK_APP_PATH` if the executable cannot be discovered.
+
+Profiles normally live at `%APPDATA%\Elgato\StreamDeck\ProfilesV3` (with `ProfilesV2`
+supported for older profiles). The app executable is normally discovered from the running
+process or standard `Program Files` locations; override it only when necessary:
+
+```text
+STREAMDECK_APP_PATH=C:\Program Files\Elgato\StreamDeck\StreamDeck.exe
+```
+
+When an MCP client runs in WSL2, the server must still be a Windows process so that it can
+use Windows profile paths and process APIs. Configure the client to launch Windows `uvx.exe`,
+for example:
+
+```json
+{
+  "mcpServers": {
+    "streamdeck": {
+      "command": "C:\\path\\to\\uvx.exe",
+      "args": ["streamdeck-mcp"]
+    }
+  }
+}
+```
+
+Use your actual Windows installation path in client configuration; do not run the profile
+writer natively inside WSL/Linux. Windows command scripts are outside this profile-lifecycle
+support: `streamdeck_create_action` continues to create POSIX shell scripts only.
+
 ### Linux and Headless Setups
 
 The default profile writer targets the Elgato Stream Deck desktop app, which is available on macOS and Windows. On Linux, headless machines, or setups where you want the MCP server to own the hardware directly, use the legacy USB server:
@@ -179,7 +212,7 @@ Client config shape:
 | `streamdeck_write_page` | Creates or rewrites a page manifest. Prefer `action` from `find_actions` / `button.raw` when reusing configured third-party plugin actions. |
 | `streamdeck_create_icon` | Generates button or touch-strip PNGs from Material Design Icons or text. Icons are bundled offline; unknown names return close-match suggestions. |
 | `streamdeck_create_action` | Creates an executable shell script in `~/StreamDeckScripts/` and returns an Open action block. |
-| `streamdeck_restart_app` | Restarts the macOS Stream Deck desktop app after profile changes. |
+| `streamdeck_restart_app` | Restarts the macOS or Windows Stream Deck desktop app after profile changes. |
 | `streamdeck_install_mcp_plugin` | Installs the bundled streamdeck-mcp Stream Deck plugin used for durable encoder imagery. Usually auto-installed by `streamdeck_write_page`. |
 
 Prompt support:
@@ -230,9 +263,28 @@ To audit this repo against the shared Very Good Plugins MCP standards:
 
 - `ProfilesV3` is preferred when present. `ProfilesV2` is still supported, but existing pages should be targeted by `directory_id` or `page_index` because Elgato uses opaque directory names there.
 - The Elgato desktop app keeps profiles in memory and can overwrite on-disk manifest edits when it quits. `streamdeck_write_page` raises `StreamDeckAppRunningError` when the app is running and `auto_quit_app` is not set.
-- On macOS, pass `auto_quit_app: true` to quit the app before writing, then call `streamdeck_restart_app` when done. On Windows, quit and relaunch the Elgato app manually.
-- Set `STREAMDECK_APP_PATH` if your Elgato app is not installed at `/Applications/Elgato Stream Deck.app`.
+- On macOS and Windows, pass `auto_quit_app: true` to request a graceful quit before writing, then call `streamdeck_restart_app` when the batch of edits is complete. On Windows the write is blocked if the app does not exit within the timeout; the server never force-terminates Stream Deck because that may discard unsaved app state.
+- If automatic shutdown is not requested, close Stream Deck manually and retry the write. If restart fails after a successful write, the profile edit remains valid: launch Stream Deck manually, then verify the page. No profile rollback is attempted.
+- Set `STREAMDECK_APP_PATH` if your Elgato app is not installed at `/Applications/Elgato Stream Deck.app` on macOS or cannot be discovered on Windows.
 - Generated icons live in `~/.streamdeck-mcp/generated-icons/`. Generated shell scripts live in `~/StreamDeckScripts/`.
+
+### Windows validation
+
+Windows process operations are mocked in the automated suite; no test terminates a real app.
+Run the focused checks with:
+
+```bash
+uv run pytest tests/test_profile_manager.py -k windows -q
+uv run pytest tests/ -q
+```
+
+For a manual Windows 11 check, first export or copy a disposable Stream Deck profile from
+`%APPDATA%\Elgato\StreamDeck\ProfilesV3`. Start the real Stream Deck desktop app, attempt a
+small `streamdeck_write_page` without `auto_quit_app`, and confirm it refuses before changing
+the manifest. Repeat with `auto_quit_app: true`, verify the app closes cleanly and the page is
+written, then invoke `streamdeck_restart_app` and confirm the app starts and loads the change.
+Finally repeat with the app closed to validate the manual close-and-retry path. Restore the
+backup if the profile is not as expected.
 
 ### Legacy USB Mode
 
