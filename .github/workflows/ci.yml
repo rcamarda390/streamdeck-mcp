@@ -34,7 +34,7 @@ jobs:
         run: ruff check .
 
       - name: Check formatting
-        run: ruff format --check .
+        run: ruff format --check $(git ls-files '*.py')
 
       - name: Run tests with coverage
         run: pytest tests/ -v --cov=. --cov-report=xml --cov-report=term-missing
