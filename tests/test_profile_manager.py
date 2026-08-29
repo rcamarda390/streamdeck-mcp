@@ -1046,7 +1046,7 @@ def test_create_action_writes_script_and_returns_open_action(
     )
     project_dir = tmp_path / "project"
 
-        with patch("profile_manager.sys.platform", "darwin"):
+    with patch("profile_manager.sys.platform", "darwin"):
         result = manager.create_action(
             name="Git Pull",
             command="git pull",
