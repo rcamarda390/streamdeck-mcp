@@ -2389,9 +2389,7 @@ def test_list_profiles_reads_utf8_page_manifests(tmp_path: Path) -> None:
     assert len(profiles) == 1
     assert profiles[0]["pages"][0]["name"] == "Emoji"
     page = manager.read_page(profile_name="UTF-8 Profile", page_index=0)
-    pasted_text = page["raw_manifest"]["Controllers"][0]["Actions"]["0,0"]["Settings"][
-        "pastedText"
-    ]
+    pasted_text = page["raw_manifest"]["Controllers"][0]["Actions"]["0,0"]["Settings"]["pastedText"]
     assert pasted_text == "👍"
 
 
