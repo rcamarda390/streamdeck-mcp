@@ -1046,11 +1046,12 @@ def test_create_action_writes_script_and_returns_open_action(
     )
     project_dir = tmp_path / "project"
 
-    result = manager.create_action(
-        name="Git Pull",
-        command="git pull",
-        working_directory=str(project_dir),
-    )
+        with patch("profile_manager.sys.platform", "darwin"):
+        result = manager.create_action(
+            name="Git Pull",
+            command="git pull",
+            working_directory=str(project_dir),
+        )
 
     script_path = Path(result["script_path"])
     assert script_path.exists()
